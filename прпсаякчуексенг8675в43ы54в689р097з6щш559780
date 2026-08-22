@@ -57,7 +57,7 @@ logging.basicConfig(
 logger = logging.getLogger("ShishaniTools")
 
 # ==================== КОНФИГУРАЦИЯ БОТА ====================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8636106283:AAEjygKDMjdq1x13oBY8ZXGnELP3rA_TyQ0"
 ADMIN_ID = 7438196141
 
 # Старый канал
