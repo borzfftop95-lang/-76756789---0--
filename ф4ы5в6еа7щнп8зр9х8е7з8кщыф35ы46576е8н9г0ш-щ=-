@@ -1,0 +1,1148 @@
+import subprocess
+import sys
+
+# ==================== АВТО-УСТАНОВКА ЗАВИСИМОСТЕЙ ====================
+def install_package(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import aiogram
+except ImportError:
+    print("[!] Установка aiogram...")
+    install_package("aiogram")
+    import aiogram
+
+try:
+    from PIL import Image
+except ImportError:
+    print("[!] Установка Pillow...")
+    install_package("Pillow")
+    from PIL import Image
+
+try:
+    import texture2ddecoder
+except ImportError:
+    print("[!] Установка texture2ddecoder...")
+    try:
+        install_package("texture2ddecoder")
+        import texture2ddecoder
+    except Exception as e:
+        print(f"[⚠️] Не удалось установить texture2ddecoder: {e}")
+        texture2ddecoder = None
+
+import asyncio
+import logging
+import os
+import io
+import json
+import re
+import struct
+import zipfile
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import BufferedInputFile
+from aiogram.exceptions import TelegramBadRequest
+
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - (%(filename)s:%(lineno)d) - %(message)s"
+)
+logger = logging.getLogger("ShishaniTools")
+
+# ==================== КОНФИГУРАЦИЯ БОТА ====================
+BOT_TOKEN = "8636106283:AAEjygKDMjdq1x13oBY8ZXGnELP3rA_TyQ0"
+ADMIN_ID = 7438196141
+
+# Старый канал
+CHANNEL_USERNAME = "@Frozen_crmp"
+CHANNEL_ID = -1002033517632
+
+# Новая группа (ОБЯЗАТЕЛЬНО замени ID на реальный!)
+NEW_GROUP_ID = -100XXXXXXXXXX          # ← сюда вставь реальный ID группы
+NEW_GROUP_LINK = "https://t.me/+hdUhvZlrQAMzZGVi"
+
+EMOJI_PRIVATES = "5960888357390126718"
+EMOJI_CHANNELS = "5766879414704935108"
+EMOJI_CONVERT = "5877332341331857066"
+EMOJI_ADMIN = "5260268501515377807"
+EMOJI_DECRYPT = "5258200019495821936"
+
+DATA_FILE = "bot_database.json"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+user_batch_buffers = {}
+
+# ==================== БЕЗОПАСНЫЙ CALLBACK ====================
+async def safe_answer_callback(callback: types.CallbackQuery, text: str = None, show_alert: bool = False):
+    try:
+        await callback.answer(text=text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e) or "query ID is invalid" in str(e):
+            logger.warning(f"Пропущен устаревший callback query: {e}")
+        else:
+            raise e
+
+# ==================== FSM СОСТОЯНИЯ ====================
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_ban = State()
+    waiting_for_unban = State()
+    waiting_for_threshold = State()
+
+class ConvertStates(StatesGroup):
+    waiting_for_file = State()
+
+# ==================== БАЗА ДАННЫХ ====================
+def load_db() -> dict:
+    default_db = {
+        "users": {},
+        "conversions_count": 0,
+        "maintenance": False,
+        "private_threshold": 100
+    }
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for key in default_db:
+                    if key not in data:
+                        data[key] = default_db[key]
+                return data
+        return default_db
+    except Exception as e:
+        logger.error(f"Ошибка загрузки БД: {e}")
+        return default_db
+
+def save_db(db_data: dict):
+    try:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(db_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения БД: {e}")
+
+def update_user_activity(user_id: int):
+    db = load_db()
+    uid_str = str(user_id)
+    now_str = datetime.now().isoformat()
+    if uid_str not in db["users"]:
+        db["users"][uid_str] = {
+            "joined": now_str,
+            "last_active": now_str,
+            "banned": False
+        }
+    else:
+        db["users"][uid_str]["last_active"] = now_str
+    save_db(db)
+
+def is_user_banned(user_id: int) -> bool:
+    db = load_db()
+    return db["users"].get(str(user_id), {}).get("banned", False)
+
+def increment_conversions(count: int = 1):
+    db = load_db()
+    db["conversions_count"] += count
+    save_db(db)
+
+def get_stats() -> dict:
+    db = load_db()
+    users = db["users"]
+    now = datetime.now()
+    total_users = len(users)
+    banned_users = sum(1 for u in users.values() if u.get("banned", False))
+
+    online_15m = 0
+    active_24h = 0
+    for u in users.values():
+        last_active_str = u.get("last_active")
+        if last_active_str:
+            try:
+                last_active = datetime.fromisoformat(last_active_str)
+                delta = now - last_active
+                if delta <= timedelta(minutes=15):
+                    online_15m += 1
+                if delta <= timedelta(hours=24):
+                    active_24h += 1
+            except Exception:
+                pass
+    return {
+        "total_users": total_users,
+        "online_15m": online_15m,
+        "active_24h": active_24h,
+        "banned_users": banned_users,
+        "conversions_count": db["conversions_count"],
+        "maintenance": db["maintenance"],
+        "private_threshold": db["private_threshold"]
+    }
+
+# ==================== RENDERWARE & FILE CONVERTER ENGINE ====================
+RW_CLUMP_ID      = b"\x10\x00\x00\x00"   # 0x10 — Clump (DFF)
+RW_TXD_ID        = b"\x16\x00\x00\x00"   # 0x16 — Texture Dictionary
+RW_FRAMELIST_ID  = b"\x0e\x00\x00\x00"   # 0x0E — Frame List
+RW_VERSION_SA    = 0x1803FFFF
+
+def find_ascii_names(data: bytes) -> set:
+    result = set()
+    strings = re.findall(rb"[A-Za-z0-9_\-]{3,32}", data)
+    for s in strings:
+        try:
+            name = s.decode("utf-8").lower()
+            result.add(name)
+        except Exception:
+            pass
+    return result
+
+def scan_dff(data: bytes) -> list:
+    names = find_ascii_names(data)
+    blacklist = {"clump", "geometry", "atomic", "frame", "texture", "material"}
+    return [x for x in names if x not in blacklist]
+
+def scan_txd(data: bytes) -> set:
+    return find_ascii_names(data)
+
+def compare_dff_txd(dff_bytes: bytes, txd_bytes: bytes):
+    need = scan_dff(dff_bytes)
+    have = scan_txd(txd_bytes)
+    found = [tex for tex in need if tex in have]
+    missing = [tex for tex in need if tex not in have]
+    return found, missing
+
+class FileConverter:
+    @staticmethod
+    def read_rw_chunk(data: bytes, offset: int):
+        if offset + 12 > len(data):
+            return None
+        chunk_id = int.from_bytes(data[offset:offset+4], "little")
+        size = int.from_bytes(data[offset+4:offset+8], "little")
+        version = data[offset+8:offset+12]
+        end = offset + 12 + size
+        if end > len(data) or size == 0:
+            return None
+        return {"id": chunk_id, "size": size, "version": version, "start": offset, "end": end}
+
+    @classmethod
+    def find_clump(cls, data: bytes) -> int:
+        if not data or len(data) < 12:
+            return -1
+        for offset in range(len(data) - 12):
+            if data[offset:offset+4] == RW_CLUMP_ID:
+                chunk = cls.read_rw_chunk(data, offset)
+                if chunk and chunk["id"] == 0x10:
+                    return offset
+        return -1
+
+    @classmethod
+    def check_dff(cls, data: bytes) -> bool:
+        return cls.find_clump(data) >= 0
+
+    @classmethod
+    def decrypt_xor_bytes(cls, data: bytes, key: int = None) -> bytes:
+        if not data:
+            return data
+        if key is not None:
+            return bytes(b ^ key for b in data)
+        if cls.check_dff(data):
+            return data
+        for k in range(1, 256):
+            test_decoded = bytes(b ^ k for b in data)
+            if cls.check_dff(test_decoded):
+                return test_decoded
+        common_keys = [
+            b"SHISHANI", b"FROZEN", b"CRMP", b"MODEL", b"TXD",
+            b"SHISHANI_TOOLS", b"PROTECT", b"PRIVAT", b"ZMODELER",
+            b"\xAA\xBB\xCC\xDD", b"\xFF\xFE\xFD\xFC"
+        ]
+        for ckey in common_keys:
+            decoded = bytes(data[i] ^ ckey[i % len(ckey)] for i in range(len(data)))
+            if cls.check_dff(decoded):
+                return decoded
+        inverted = bytes((~b) & 0xFF for b in data)
+        if cls.check_dff(inverted):
+            return inverted
+        return data
+
+    @classmethod
+    def unprotect_rw_model(cls, data_input: bytes) -> bytes:
+        if not data_input:
+            return data_input
+        decoded = cls.decrypt_xor_bytes(data_input)
+        pos = cls.find_clump(decoded)
+        if pos >= 0:
+            data = bytearray(decoded[pos:])
+        else:
+            frame_pos = decoded.find(RW_FRAMELIST_ID)
+            if 0 < frame_pos <= 256:
+                clean_header = (
+                    RW_CLUMP_ID +
+                    (len(decoded) - frame_pos).to_bytes(4, "little") +
+                    struct.pack("<I", RW_VERSION_SA)
+                )
+                data = bytearray(clean_header + decoded[frame_pos:])
+            else:
+                data = bytearray(decoded)
+
+        length = len(data)
+        curr_pos = 0
+        CHUNK_CLUMP         = 0x10
+        CHUNK_FRAME_LIST    = 0x0E
+        CHUNK_GEOMETRY_LIST = 0x1A
+        CHUNK_GEOMETRY      = 0x0F
+
+        while curr_pos <= length - 12:
+            chunk_type, chunk_size, chunk_ver = struct.unpack("<III", data[curr_pos:curr_pos + 12])
+            if (chunk_ver & 0xFFFF0000) != 0x18000000 and chunk_type in (
+                CHUNK_CLUMP, CHUNK_FRAME_LIST, CHUNK_GEOMETRY_LIST, CHUNK_GEOMETRY
+            ):
+                struct.pack_into("<I", data, curr_pos + 8, RW_VERSION_SA)
+            if chunk_type == CHUNK_FRAME_LIST:
+                struct_pos = curr_pos + 12
+                if struct_pos + 16 <= length:
+                    num_frames = struct.unpack("<I", data[struct_pos + 12:struct_pos + 16])[0]
+                    if num_frames == 0 or num_frames > 4096:
+                        actual_frames = (chunk_size - 4) // 56
+                        if actual_frames > 0:
+                            struct.pack_into("<I", data, struct_pos + 12, actual_frames)
+                if struct_pos + 8 <= length:
+                    struct.pack_into("<I", data, struct_pos + 8, RW_VERSION_SA)
+            step = 12 + chunk_size
+            if step <= 0 or (curr_pos + step) > length:
+                break
+            curr_pos += step
+        return bytes(data)
+
+    @staticmethod
+    def png_to_bmp(input_bytes: bytes) -> bytes:
+        img = Image.open(io.BytesIO(input_bytes))
+        if img.mode in ('RGBA', 'LA', 'P'):
+            rgb = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            if img.mode in ('RGBA', 'LA'):
+                rgb.paste(img, mask=img.split()[-1])
+            else:
+                rgb.paste(img)
+            img = rgb
+        out = io.BytesIO()
+        img.save(out, format='BMP')
+        return out.getvalue()
+
+    @staticmethod
+    def bmp_to_png(input_bytes: bytes) -> bytes:
+        img = Image.open(io.BytesIO(input_bytes))
+        out = io.BytesIO()
+        img.save(out, format='PNG')
+        return out.getvalue()
+
+    @staticmethod
+    def txd_to_png(input_bytes: bytes) -> bytes:
+        if not input_bytes.startswith(RW_TXD_ID):
+            input_bytes = FileConverter.unprotect_rw_model(input_bytes)
+
+        def read_chunk(data, offset):
+            if offset + 12 > len(data):
+                return None
+            ctype, csize, cver = struct.unpack_from('<III', data, offset)
+            return ctype, csize, cver, offset + 12, data[offset + 12:offset + 12 + csize]
+
+        def find_native(data):
+            pos = 0
+            while pos < len(data) - 12:
+                chunk = read_chunk(data, pos)
+                if not chunk:
+                    break
+                ctype, csize, _, next_pos, payload = chunk
+                if ctype == 0x15:
+                    return payload
+                elif ctype == 0x16:
+                    inner = find_native(payload)
+                    if inner:
+                        return inner
+                pos = next_pos + csize
+            return None
+
+        native = find_native(input_bytes)
+        if not native:
+            raise ValueError("Не найден заголовок Native Texture (0x15)")
+
+        struct_data = None
+        pos = 0
+        while pos < len(native) - 12:
+            chunk = read_chunk(native, pos)
+            if not chunk:
+                break
+            ctype, csize, _, next_pos, payload = chunk
+            if ctype == 0x01:
+                struct_data = payload
+                break
+            pos = next_pos + csize
+
+        if struct_data is None:
+            raise ValueError("Внутри Native Texture не найден Struct (0x01)")
+
+        if len(struct_data) < 88:
+            width = struct.unpack_from('<H', struct_data, 12)[0]
+            height = struct.unpack_from('<H', struct_data, 14)[0]
+            raw = struct_data[72:]
+        else:
+            width = struct.unpack_from('<H', struct_data, 80)[0]
+            height = struct.unpack_from('<H', struct_data, 82)[0]
+            flags = struct.unpack_from('<I', struct_data, 72)[0] if len(struct_data) > 72 else 0
+            raw = struct_data[88:]
+
+        is_dxt = False
+        dxt_type = 0
+        if flags & 0x10:
+            is_dxt, dxt_type = True, 1
+        elif flags & 0x20:
+            is_dxt, dxt_type = True, 3
+        elif flags & 0x30:
+            is_dxt, dxt_type = True, 5
+
+        if texture2ddecoder and is_dxt:
+            try:
+                if dxt_type == 1:
+                    decoded = texture2ddecoder.decode_dxt1(raw, width, height)
+                else:
+                    decoded = texture2ddecoder.decode_dxt5(raw, width, height)
+                img = Image.frombytes('RGBA', (width, height), decoded, 'raw', 'BGRA')
+                out = io.BytesIO()
+                img.save(out, format='PNG')
+                return out.getvalue()
+            except Exception as e:
+                logger.warning(f"Ошибка DXT декодирования: {e}")
+
+        expected_size = width * height * 4
+        if len(raw) >= expected_size:
+            raw = raw[:expected_size]
+            img = Image.frombytes('RGBA', (width, height), raw, 'raw', 'BGRA')
+            out = io.BytesIO()
+            img.save(out, format='PNG')
+            return out.getvalue()
+        raise ValueError("Неподдерживаемый формат упакованных пикселей TXD")
+
+    @staticmethod
+    def png_to_txd(input_bytes: bytes, tex_name: str = "texture") -> bytes:
+        img = Image.open(io.BytesIO(input_bytes)).convert('RGBA')
+        width, height = img.size
+        r, g, b, a = img.split()
+        bgra = Image.merge('RGBA', (b, g, r, a))
+        pixel_data = bgra.tobytes()
+
+        def make_chunk(ctype, data, version=0x1803FFFF):
+            return struct.pack('<III', ctype, len(data), version) + data
+
+        name = tex_name.encode('ascii', 'ignore')[:31].ljust(32, b'\x00')
+        mask = b'\x00' * 32
+        struct_header = struct.pack('<II', 0x00000004, 0x00001100)
+        raster_header = struct.pack('<IIHHBB', 0x00000000, len(pixel_data), width, height, 32, 1)
+        padding = b'\x00\x00'
+        struct_data = struct_header + name + mask + raster_header + padding + pixel_data
+        struct_chunk = make_chunk(0x01, struct_data)
+        ext_chunk = make_chunk(0x03, b'')
+        native_chunk = make_chunk(0x15, struct_chunk + ext_chunk)
+        txd_struct = make_chunk(0x01, struct.pack('<HH', 1, 0))
+        return make_chunk(0x16, txd_struct + native_chunk + ext_chunk)
+
+    @staticmethod
+    def create_multi_txd_from_pngs(png_dict: dict) -> bytes:
+        if len(png_dict) == 1:
+            name, data = list(png_dict.items())[0]
+            stem = os.path.splitext(name)[0]
+            return FileConverter.png_to_txd(data, tex_name=stem)
+        result = b""
+        for name, img_bytes in png_dict.items():
+            stem = os.path.splitext(name)[0]
+            try:
+                result += FileConverter.png_to_txd(img_bytes, tex_name=stem)
+            except Exception as e:
+                logger.error(f"Ошибка упаковки {name}: {e}")
+        return result
+
+    @staticmethod
+    def btx_to_png(input_bytes: bytes) -> bytes:
+        png_start = input_bytes.find(b'\x89PNG\r\n\x1a\n')
+        if png_start != -1:
+            return input_bytes[png_start:]
+        try:
+            if len(input_bytes) < 16:
+                raise ValueError("Файл BTX слишком мал")
+            width = struct.unpack_from('<H', input_bytes, 4)[0]
+            height = struct.unpack_from('<H', input_bytes, 6)[0]
+            if width > 0 and height > 0 and texture2ddecoder:
+                raw = input_bytes[16:]
+                decoded = texture2ddecoder.decode_etc2(raw, width, height)
+                img = Image.frombytes('RGBA', (width, height), decoded, 'raw', 'BGRA')
+                out = io.BytesIO()
+                img.save(out, format='PNG')
+                return out.getvalue()
+        except Exception as e:
+            logger.warning(f"Ошибка декодирования ETC2: {e}")
+        raise ValueError("Формат BTX не содержит PNG или поврежден")
+
+    @staticmethod
+    def png_to_btx(input_bytes: bytes) -> bytes:
+        img = Image.open(io.BytesIO(input_bytes))
+        width, height = img.size
+        png_out = io.BytesIO()
+        img.save(png_out, format='PNG')
+        pdata = png_out.getvalue()
+        header = struct.pack('<4sHHII', b'BTX\x00', width, height, 1, len(pdata))
+        return header + pdata
+
+    @staticmethod
+    def txd_to_btx(input_bytes: bytes) -> bytes:
+        png_data = FileConverter.txd_to_png(input_bytes)
+        return FileConverter.png_to_btx(png_data)
+
+    @staticmethod
+    def btx_to_txd(input_bytes: bytes) -> bytes:
+        png_data = FileConverter.btx_to_png(input_bytes)
+        return FileConverter.png_to_txd(png_data)
+
+# ==================== ПРОВЕРКИ И ВАЛИДАЦИЯ ====================
+async def check_subscription(user_id: int) -> bool:
+    """Проверяет подписку на ОБА обязательных чата"""
+    required_chats = [CHANNEL_ID, NEW_GROUP_ID]
+    for chat_id in required_chats:
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            if member.status not in ["creator", "administrator", "member"]:
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписки на {chat_id}: {e}")
+            return False
+    return True
+
+async def pre_check(user_id: int) -> bool:
+    update_user_activity(user_id)
+    if is_user_banned(user_id):
+        return False
+    db = load_db()
+    if db["maintenance"] and user_id != ADMIN_ID:
+        return False
+    return True
+
+# ==================== КЛАВИАТУРЫ ====================
+def get_main_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    btn_privates = types.InlineKeyboardButton(
+        text="Приваты",
+        callback_data="menu_privates",
+        icon_custom_emoji_id=EMOJI_PRIVATES
+    )
+    btn_channels = types.InlineKeyboardButton(
+        text="Каналы",
+        callback_data="menu_channels",
+        icon_custom_emoji_id=EMOJI_CHANNELS
+    )
+    btn_convert = types.InlineKeyboardButton(
+        text="Конвертация",
+        callback_data="menu_convert",
+        icon_custom_emoji_id=EMOJI_CONVERT
+    )
+    builder.row(btn_privates)
+    builder.row(btn_channels, btn_convert)
+    if user_id == ADMIN_ID:
+        btn_admin = types.InlineKeyboardButton(
+            text="👑 Админ Панель",
+            callback_data="admin_panel",
+            icon_custom_emoji_id=EMOJI_ADMIN
+        )
+        builder.row(btn_admin)
+    return builder.as_markup()
+
+def get_sub_keyboard():
+    builder = InlineKeyboardBuilder()
+    # Кнопка на старый канал
+    builder.row(types.InlineKeyboardButton(
+        text="📢 Подписаться на Frozen CRM",
+        url=f"https://t.me/{CHANNEL_USERNAME[1:]}"
+    ))
+    # Кнопка на новую группу
+    builder.row(types.InlineKeyboardButton(
+        text="🔒 Подписаться на Бесплатный приват",
+        url=NEW_GROUP_LINK
+    ))
+    builder.row(types.InlineKeyboardButton(
+        text="✅ Проверить подписку",
+        callback_data="check_sub"
+    ))
+    return builder.as_markup()
+
+def get_back_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="Назад в меню", callback_data="back_to_main"))
+    return builder.as_markup()
+
+def get_batch_actions_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="⚡ Конвертировать все файлы", callback_data="batch_convert_all")
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="🔎 Сравнить DFF ↔ TXD", callback_data="batch_compare_dff_txd")
+    )
+    builder.row(
+        types.InlineKeyboardButton(
+            text="🔓 Снять защиту / Расшифровать",
+            callback_data="batch_unprotect",
+            icon_custom_emoji_id=EMOJI_DECRYPT
+        )
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="📦 Упаковать PNG в TXD", callback_data="batch_pack_png_txd")
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="🗑 Очистить список", callback_data="batch_clear"),
+        types.InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_to_main")
+    )
+    return builder.as_markup()
+
+# ==================== ОБРАБОТКА /start ====================
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext):
+    user = message.from_user
+    if not await pre_check(user.id):
+        if is_user_banned(user.id):
+            await message.answer("<b>❌ Ваш аккаунт заблокирован!</b>", parse_mode="HTML")
+        else:
+            await message.answer("<b>🛠 Бот на техническом обслуживании.</b>", parse_mode="HTML")
+        return
+
+    await state.clear()
+    is_sub = await check_subscription(user.id)
+    if not is_sub:
+        await message.answer(
+            "<b>Для использования бота необходима подписка на оба канала/группы:</b>\n\n"
+            "1. Подпишитесь на <b>Frozen CRM Project</b>\n"
+            "2. Подпишитесь на <b>Бесплатный приват</b>\n"
+            "3. Нажмите кнопку «Проверить подписку»",
+            reply_markup=get_sub_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    welcome_text = (
+        "<b>Shishani Tools — бот-помощник для навигации по проектам и конвертации файлов SHISHANI</b>\n\n"
+        "💡 <i>Отправьте мне один или несколько файлов (.dff, .txd, .mod, .png, .btx, .zip), чтобы начать обработку!</i>\n\n"
+        "<blockquote><b>По всем вопросам: @Frozen_Shishan</b></blockquote>"
+    )
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(user.id), parse_mode="HTML")
+
+# ==================== ОБРАБОТЧИКИ МЕНЮ ====================
+@dp.callback_query(F.data == "check_sub")
+async def process_check_sub(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    if await check_subscription(user_id):
+        await safe_answer_callback(callback, "Подписка подтверждена!", show_alert=True)
+        await cmd_start(callback.message, state)
+    else:
+        await safe_answer_callback(callback, "Вы ещё не подписаны на все обязательные каналы/группы!", show_alert=True)
+
+@dp.callback_query(F.data == "back_to_main")
+async def process_back_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    if user_id in user_batch_buffers:
+        del user_batch_buffers[user_id]
+
+    welcome_text = (
+        "<b>Shishani Tools — бот-помощник для навигации по проектам и конвертации файлов SHISHANI</b>\n\n"
+        "<blockquote><b>По всем вопросам: @Frozen_Shishan</b></blockquote>"
+    )
+    await callback.message.edit_text(welcome_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "menu_privates")
+async def process_privates_menu(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(
+            text="Бесплатный приват",
+            url=NEW_GROUP_LINK
+        )
+    )
+    builder.row(
+        types.InlineKeyboardButton(
+            text="Назад в главное меню",
+            callback_data="back_to_main"
+        )
+    )
+
+    text = f"<b><tg-emoji emoji-id='{EMOJI_PRIVATES}'>🔒</tg-emoji> Наши приваты:</b>"
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "menu_channels")
+async def process_channels_menu(callback: types.CallbackQuery):
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="Frozen CRM Project", url="https://t.me/Frozen_crmp"))
+    builder.row(types.InlineKeyboardButton(text="Shishani MTA", url="https://t.me/Shishani_mta"))
+    builder.row(types.InlineKeyboardButton(text="Shishani Tuning", url="https://t.me/Shishani_Tuning"))
+    builder.row(types.InlineKeyboardButton(text="CRMP Tutorial", url="https://t.me/Crmp_Tutorial"))
+    builder.row(types.InlineKeyboardButton(text="Назад в главное меню", callback_data="back_to_main"))
+
+    text = f"<b><tg-emoji emoji-id='{EMOJI_CHANNELS}'>📢</tg-emoji> Наши каналы:</b>"
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "menu_convert")
+async def process_convert_menu(callback: types.CallbackQuery):
+    text = (
+        f"<b><tg-emoji emoji-id='{EMOJI_CONVERT}'>🔄</tg-emoji> Конвертация и очистка файлов</b>\n\n"
+        "<b>Просто отправьте боту один или несколько файлов в чат!</b>\n\n"
+        "<b>Поддерживаемые форматы:</b>\n"
+        "• <b>.mod / .dff</b> — Модели RenderWare (восстановление иерархии / XOR)\n"
+        "• <b>.txd ↔ .btx</b> — Прямой конвертер текстурных архивов\n"
+        "• <b>.png / .bmp</b> — Изображения и текстуры\n"
+        "• <b>.zip</b> — Архивы с набором файлов"
+    )
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+# ==================== МНОГОФАЙЛОВЫЙ / ПАКЕТНЫЙ ПРИЕМ ====================
+@dp.message(F.document)
+async def process_incoming_documents(message: types.Message):
+    user_id = message.from_user.id
+    if not await pre_check(user_id):
+        return
+
+    doc = message.document
+    filename = doc.file_name
+    low_name = filename.lower()
+    valid_extensions = [".dff", ".txd", ".mod", ".btx", ".png", ".bmp", ".zip"]
+
+    if not any(low_name.endswith(ext) for ext in valid_extensions):
+        await message.reply("⚠️ Неподдерживаемый формат файла!")
+        return
+
+    file_io = await bot.download(doc.file_id)
+    file_bytes = file_io.read()
+
+    if user_id not in user_batch_buffers:
+        user_batch_buffers[user_id] = {"files": {}, "msg_id": None}
+
+    buf = user_batch_buffers[user_id]
+
+    if low_name.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as z:
+                for item in z.infolist():
+                    if item.is_dir():
+                        continue
+                    fname = os.path.basename(item.filename)
+                    if any(fname.lower().endswith(ext) for ext in valid_extensions if ext != ".zip"):
+                        buf["files"][fname] = z.read(item.filename)
+        except Exception as e:
+            logger.error(f"Ошибка распаковки ZIP: {e}")
+            await message.reply("❌ Ошибка чтения ZIP архива.")
+            return
+    else:
+        buf["files"][filename] = file_bytes
+
+    count = len(buf["files"])
+    file_list_str = "\n".join([f"• <code>{name}</code>" for name in list(buf["files"].keys())[:10]])
+    if count > 10:
+        file_list_str += f"\n...и еще {count - 10} файлов"
+
+    menu_text = (
+        f"<b>📥 Получено файлов: {count}</b>\n\n"
+        f"{file_list_str}\n\n"
+        "<b>Выберите необходимое действие с файлами:</b>"
+    )
+
+    if buf["msg_id"]:
+        try:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=buf["msg_id"],
+                text=menu_text,
+                reply_markup=get_batch_actions_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+        except Exception:
+            pass
+
+    sent_msg = await message.answer(menu_text, reply_markup=get_batch_actions_keyboard(), parse_mode="HTML")
+    buf["msg_id"] = sent_msg.message_id
+
+# ==================== ОБРАБОТЧИКИ ПАКЕТНЫХ ДЕЙСТВИЙ ====================
+@dp.callback_query(F.data == "batch_clear")
+async def process_batch_clear(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in user_batch_buffers:
+        del user_batch_buffers[user_id]
+    await callback.message.edit_text("<b>🗑 Список загруженных файлов очищен!</b>", reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "batch_convert_all")
+async def process_batch_convert_all(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_batch_buffers or not user_batch_buffers[user_id]["files"]:
+        await safe_answer_callback(callback, "Файлы не найдены! Загрузите файлы снова.", show_alert=True)
+        return
+
+    files = user_batch_buffers[user_id]["files"]
+    await callback.message.edit_text("<b>🔄 Автоматическая конвертация и обработка всех файлов...</b>", parse_mode="HTML")
+
+    converted_files = {}
+    converter = FileConverter()
+
+    for name, data in files.items():
+        low = name.lower()
+        stem = os.path.splitext(name)[0]
+        try:
+            if low.endswith(".mod"):
+                clean = converter.unprotect_rw_model(data)
+                converted_files[f"{stem}.dff"] = clean
+            elif low.endswith(".png"):
+                btx_data = converter.png_to_btx(data)
+                converted_files[f"{stem}.btx"] = btx_data
+            elif low.endswith(".txd"):
+                btx_data = converter.txd_to_btx(data)
+                converted_files[f"{stem}.btx"] = btx_data
+            elif low.endswith(".btx"):
+                txd_data = converter.btx_to_txd(data)
+                converted_files[f"{stem}.txd"] = txd_data
+            elif low.endswith(".bmp"):
+                png_data = converter.bmp_to_png(data)
+                converted_files[f"{stem}.png"] = png_data
+            else:
+                converted_files[name] = data
+        except Exception as e:
+            logger.error(f"Ошибка конвертации файла {name}: {e}")
+            converted_files[name] = data
+
+    increment_conversions(len(converted_files))
+
+    if len(converted_files) == 1:
+        fname, fbytes = list(converted_files.items())[0]
+        doc = BufferedInputFile(fbytes, filename=fname)
+        await callback.message.answer_document(doc, caption=f"<b>✅ Файл успешно обработан: {fname}</b>", parse_mode="HTML")
+    else:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for fname, fbytes in converted_files.items():
+                zout.writestr(fname, fbytes)
+        zip_buf.seek(0)
+        doc = BufferedInputFile(zip_buf.read(), filename="converted_files.zip")
+        await callback.message.answer_document(doc, caption=f"<b>✅ Пакетная конвертация {len(converted_files)} файлов завершена!</b>", parse_mode="HTML")
+
+    del user_batch_buffers[user_id]
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "batch_compare_dff_txd")
+async def process_batch_compare(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_batch_buffers or not user_batch_buffers[user_id]["files"]:
+        await safe_answer_callback(callback, "Файлы не найдены!", show_alert=True)
+        return
+
+    files = user_batch_buffers[user_id]["files"]
+    dff_data = next((v for k, v in files.items() if k.lower().endswith(".dff")), None)
+    txd_data = next((v for k, v in files.items() if k.lower().endswith(".txd")), None)
+
+    if not dff_data or not txd_data:
+        await safe_answer_callback(callback, "Для проверки отправьте одновременно хотя бы один .dff и один .txd!", show_alert=True)
+        return
+
+    found, missing = compare_dff_txd(dff_data, txd_data)
+
+    text = f"<b>🔎 Результат проверки DFF ↔ TXD</b>\n\n"
+    text += f"✅ Найдено текстур в TXD: <b>{len(found)}</b>\n"
+    text += f"❌ Отсутствует в TXD: <b>{len(missing)}</b>\n\n"
+    if found:
+        text += "<b>Присутствуют:</b>\n" + "".join([f"• <code>{x}</code>\n" for x in found[:15]])
+    if missing:
+        text += "\n<b>Отсутствуют в контейнере:</b>\n" + "".join([f"• <code>{x}</code>\n" for x in missing[:15]])
+    if not missing:
+        text += "\n🎉 <b>Отлично! Все текстуры модели присутствуют в TXD архиве.</b>"
+
+    await callback.message.answer(text, parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "batch_unprotect")
+async def process_batch_unprotect(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_batch_buffers or not user_batch_buffers[user_id]["files"]:
+        await safe_answer_callback(callback, "Файлы не найдены!", show_alert=True)
+        return
+
+    files = user_batch_buffers[user_id]["files"]
+    converter = FileConverter()
+    clean_models = {}
+
+    for name, data in files.items():
+        low = name.lower()
+        if low.endswith((".mod", ".dff", ".txd")):
+            clean = converter.unprotect_rw_model(data)
+            out_name = os.path.splitext(name)[0] + ("_clean.dff" if low.endswith((".dff", ".mod")) else "_clean.txd")
+            clean_models[out_name] = clean
+
+    if not clean_models:
+        await safe_answer_callback(callback, "Среди загруженных файлов нет .mod, .dff или .txd моделей!", show_alert=True)
+        return
+
+    increment_conversions(len(clean_models))
+
+    if len(clean_models) == 1:
+        fname, fbytes = list(clean_models.items())[0]
+        doc = BufferedInputFile(fbytes, filename=fname)
+        await callback.message.answer_document(doc, caption="<b>🔓 Защита снята / Иерархия полностью восстановлена!</b>", parse_mode="HTML")
+    else:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for fname, fbytes in clean_models.items():
+                zout.writestr(fname, fbytes)
+        zip_buf.seek(0)
+        doc = BufferedInputFile(zip_buf.read(), filename="unprotected_files.zip")
+        await callback.message.answer_document(doc, caption=f"<b>🔓 Расшифровано и восстановлено файлов: {len(clean_models)}!</b>", parse_mode="HTML")
+
+    del user_batch_buffers[user_id]
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "batch_pack_png_txd")
+async def process_batch_pack_png_txd(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_batch_buffers or not user_batch_buffers[user_id]["files"]:
+        await safe_answer_callback(callback, "Файлы не найдены!", show_alert=True)
+        return
+
+    files = user_batch_buffers[user_id]["files"]
+    png_files = {k: v for k, v in files.items() if k.lower().endswith(".png")}
+
+    if not png_files:
+        await safe_answer_callback(callback, "Не найдено ни одного .png файла!", show_alert=True)
+        return
+
+    converter = FileConverter()
+    txd_bytes = converter.create_multi_txd_from_pngs(png_files)
+    increment_conversions()
+
+    doc = BufferedInputFile(txd_bytes, filename="packed_textures.txd")
+    await callback.message.answer_document(doc, caption=f"<b>📦 Создан TXD контейнер из {len(png_files)} PNG текстур.</b>", parse_mode="HTML")
+
+    del user_batch_buffers[user_id]
+    await safe_answer_callback(callback)
+
+# ==================== АДМИН ПАНЕЛЬ ====================
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await show_admin_panel_msg(message)
+
+@dp.callback_query(F.data == "admin_panel")
+async def process_admin_panel(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_answer_callback(callback, "Доступ запрещен!", show_alert=True)
+        return
+    await show_admin_panel_callback(callback)
+
+async def show_admin_panel_callback(callback: types.CallbackQuery):
+    stats = get_stats()
+    maint = "ВКЛ ⚠️" if stats["maintenance"] else "ВЫКЛ ✅"
+    text = (
+        "<b>👑 Панель Администратора</b>\n\n"
+        "<b>📊 Статистика бота:</b>\n"
+        f"<b>• Всего пользователей: {stats['total_users']}</b>\n"
+        f"<b>• В сети (за 15 мин): {stats['online_15m']}</b>\n"
+        f"<b>• Активных (за 24 ч): {stats['active_24h']}</b>\n"
+        f"<b>• Заблокированных: {stats['banned_users']}</b>\n"
+        f"<b>• Выполнено конвертаций: {stats['conversions_count']}</b>\n"
+        f"<b>• Порог бесплатного привата: {stats['private_threshold']} чел.</b>\n"
+        f"<b>• Тех. обслуживание: {maint}</b>"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast"))
+    builder.row(types.InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="admin_panel"))
+    builder.row(types.InlineKeyboardButton(text="🛠 Режим обслуживания", callback_data="admin_toggle_maint"))
+    builder.row(
+        types.InlineKeyboardButton(text="⛔ Заблокировать", callback_data="admin_ban"),
+        types.InlineKeyboardButton(text="✅ Разблокировать", callback_data="admin_unban")
+    )
+    builder.row(types.InlineKeyboardButton(text="📂 Экспорт базы (TXT)", callback_data="admin_export"))
+    builder.row(types.InlineKeyboardButton(text="⚙️ Изменить порог привата", callback_data="admin_set_threshold"))
+    builder.row(types.InlineKeyboardButton(text="🏠 Назад в меню", callback_data="back_to_main"))
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+async def show_admin_panel_msg(message: types.Message):
+    stats = get_stats()
+    maint = "ВКЛ ⚠️" if stats["maintenance"] else "ВЫКЛ ✅"
+    text = (
+        "<b>👑 Панель Администратора</b>\n\n"
+        "<b>📊 Статистика бота:</b>\n"
+        f"<b>• Всего пользователей: {stats['total_users']}</b>\n"
+        f"<b>• В сети (за 15 мин): {stats['online_15m']}</b>\n"
+        f"<b>• Активных (за 24 ч): {stats['active_24h']}</b>\n"
+        f"<b>• Заблокированных: {stats['banned_users']}</b>\n"
+        f"<b>• Выполнено конвертаций: {stats['conversions_count']}</b>\n"
+        f"<b>• Порог бесплатного привата: {stats['private_threshold']} чел.</b>\n"
+        f"<b>• Тех. обслуживание: {maint}</b>"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast"))
+    builder.row(types.InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="admin_panel"))
+    builder.row(types.InlineKeyboardButton(text="🛠 Режим обслуживания", callback_data="admin_toggle_maint"))
+    builder.row(
+        types.InlineKeyboardButton(text="⛔ Заблокировать", callback_data="admin_ban"),
+        types.InlineKeyboardButton(text="✅ Разблокировать", callback_data="admin_unban")
+    )
+    builder.row(types.InlineKeyboardButton(text="📂 Экспорт базы (TXT)", callback_data="admin_export"))
+    builder.row(types.InlineKeyboardButton(text="⚙️ Изменить порог привата", callback_data="admin_set_threshold"))
+    builder.row(types.InlineKeyboardButton(text="🏠 Назад в меню", callback_data="back_to_main"))
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_toggle_maint")
+async def process_toggle_maint(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    db = load_db()
+    db["maintenance"] = not db["maintenance"]
+    save_db(db)
+    await safe_answer_callback(callback, f"Режим обслуживания: {'ВКЛ' if db['maintenance'] else 'ВЫКЛ'}")
+    await show_admin_panel_callback(callback)
+
+@dp.callback_query(F.data == "admin_export")
+async def process_admin_export(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    db = load_db()
+    export_text = "ID;Joined_Date;Last_Active;Banned\n"
+    for uid, info in db["users"].items():
+        export_text += f"{uid};{info.get('joined')};{info.get('last_active')};{info.get('banned')}\n"
+    doc = BufferedInputFile(export_text.encode('utf-8'), filename="users_base.txt")
+    await bot.send_document(chat_id=ADMIN_ID, document=doc, caption="<b>📂 Экспорт базы данных</b>", parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def process_broadcast_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel"))
+    await callback.message.edit_text(
+        "<b>📢 Отправьте или перешлите пост для рассылки всем пользователям бота:</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+    await safe_answer_callback(callback)
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast_send(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    db = load_db()
+    users = [int(uid) for uid, uinfo in db["users"].items() if not uinfo.get("banned", False)]
+    status_msg = await message.answer(f"<b>⏳ Запуск рассылки на {len(users)} пользователей...</b>", parse_mode="HTML")
+    success, failed = 0, 0
+    for uid in users:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await status_msg.edit_text(
+        f"<b>✅ Рассылка завершена!</b>\n\n"
+        f"<b>• Доставлено: {success}</b>\n"
+        f"<b>• Ошибок: {failed}</b>",
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "admin_ban")
+async def process_ban_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_ban)
+    await callback.message.edit_text("<b>⛔ Введите Telegram ID для блокировки:</b>", parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.message(AdminStates.waiting_for_ban)
+async def process_ban_submit(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    try:
+        target_id = int(message.text.strip())
+        db = load_db()
+        uid_str = str(target_id)
+        if uid_str not in db["users"]:
+            db["users"][uid_str] = {
+                "joined": datetime.now().isoformat(),
+                "last_active": datetime.now().isoformat(),
+                "banned": True
+            }
+        else:
+            db["users"][uid_str]["banned"] = True
+        save_db(db)
+        await message.answer(f"<b>⛔ Пользователь {target_id} заблокирован!</b>", parse_mode="HTML")
+    except ValueError:
+        await message.answer("<b>⚠️ Введите числовой ID!</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_unban")
+async def process_unban_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_unban)
+    await callback.message.edit_text("<b>✅ Введите Telegram ID для разблокировки:</b>", parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.message(AdminStates.waiting_for_unban)
+async def process_unban_submit(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    try:
+        target_id = int(message.text.strip())
+        db = load_db()
+        uid_str = str(target_id)
+        if uid_str in db["users"]:
+            db["users"][uid_str]["banned"] = False
+            save_db(db)
+            await message.answer(f"<b>✅ Пользователь {target_id} разблокирован!</b>", parse_mode="HTML")
+        else:
+            await message.answer("<b>⚠️ Пользователь не найден!</b>", parse_mode="HTML")
+    except ValueError:
+        await message.answer("<b>⚠️ Введите числовой ID!</b>", parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_set_threshold")
+async def process_threshold_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_threshold)
+    await callback.message.edit_text("<b>⚙️ Введите новое число пользователей для привата:</b>", parse_mode="HTML")
+    await safe_answer_callback(callback)
+
+@dp.message(AdminStates.waiting_for_threshold)
+async def process_threshold_submit(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    try:
+        val = int(message.text.strip())
+        db = load_db()
+        db["private_threshold"] = val
+        save_db(db)
+        await message.answer(f"<b>⚙️ Порог установлен на {val} чел.!</b>", parse_mode="HTML")
+    except ValueError:
+        await message.answer("<b>⚠️ Введите число!</b>", parse_mode="HTML")
+
+# ==================== ЗАПУСК ====================
+async def main():
+    logger.info("Запуск бота Shishani Tools...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
